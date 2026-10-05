@@ -1,6 +1,7 @@
 // 分发包集成测试：起一个假的"DSH 服务器"(127.0.0.1:18080)，
 // 用 createProxyServer 起 HTTP(18081)+HTTPS(18082)，验证鉴权/302/gzip/WS/HTTPS，
-// 另加 frp 相关纯函数（buildFrpcToml / computeFrpUrl / normalizeDomains）断言。
+// 另起一个"要求浏览器会话"的假 DSH(18084) 验证会话 cookie 的注入与 401 重放，
+// 再加 frp 相关纯函数（buildFrpcToml / computeFrpUrl / normalizeDomains）断言。
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
@@ -8,7 +9,9 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert';
 import { createHash, createHmac } from 'node:crypto';
-import { createProxyServer, generateSelfSignedCert, createQQServer, lanIPs, buildFrpcToml, computeFrpUrl, normalizeDomains, verifyDingtalkSign, feishuEncrypt, feishuDecrypt, wecomSignature, wecomEncrypt, wecomDecrypt, xmlExtract, makeDedupe, FRP_MIRROR_URLS } from '../lib/index.mjs';
+import { brotliDecompressSync } from 'node:zlib';
+import { Readable } from 'node:stream';
+import { createProxyServer, generateSelfSignedCert, createQQServer, lanIPs, buildFrpcToml, computeFrpUrl, normalizeDomains, verifyDingtalkSign, feishuEncrypt, feishuDecrypt, wecomSignature, wecomEncrypt, wecomDecrypt, xmlExtract, makeDedupe, FRP_MIRROR_URLS, findFreePort, apply, downloadFile, tmpDownloadPath } from '../lib/index.mjs';
 
 // ─────────── 机器人通道纯函数断言 ───────────
 {
@@ -157,6 +160,14 @@ const QQ_PORT = 18083;
   assert.ok(!tomlHttps.includes('localIP'), 'no localIP in plugin mode');
   console.log('0b3. buildFrpcToml(https/https2http) OK');
 
+  // 0b4. tcpMux：只在显式配置时输出（说明：frps.toml 必须与之一致，不一致会连不上）
+  assert.ok(!toml.includes('transport.tcpMux'), 'tcpMux 默认不输出（沿用 frp 默认：开启）');
+  const tomlMuxOff = buildFrpcToml({ serverAddr: 's', serverPort: 7000, proxyName: 'p', proxyType: 'tcp', localPort: 1, remotePort: 2, tcpMux: false });
+  assert.ok(tomlMuxOff.includes('transport.tcpMux = false'), 'tcpMux=false 应写出');
+  const tomlMuxOn = buildFrpcToml({ serverAddr: 's', serverPort: 7000, proxyName: 'p', proxyType: 'tcp', localPort: 1, remotePort: 2, tcpMux: true });
+  assert.ok(tomlMuxOn.includes('transport.tcpMux = true'), 'tcpMux=true 应写出');
+  console.log('0b4. buildFrpcToml(tcpMux) OK');
+
   assert.strictEqual(
     computeFrpUrl({ frpProxyType: 'tcp', frpServerAddr: '1.2.3.4', frpRemotePort: 13080 }),
     'http://1.2.3.4:13080',
@@ -253,6 +264,7 @@ await new Promise((res, rej) => {
 });
 
 // 4. gzip 大响应
+let gzipSize = 0;
 await new Promise((res, rej) => {
   http.get({ host: '127.0.0.1', port: HTTP_PORT, path: '/big', headers: { Cookie: cookie, 'Accept-Encoding': 'gzip' } }, r => {
     let d = Buffer.alloc(0);
@@ -261,6 +273,41 @@ await new Promise((res, rej) => {
       console.log('4. gzip status:', r.statusCode, 'encoding:', r.headers['content-encoding'], 'size:', d.length, '(expect gzip, <100000)');
       assert.strictEqual(r.headers['content-encoding'], 'gzip');
       assert.ok(d.length < 100000);
+      gzipSize = d.length;
+      res();
+    });
+  }).on('error', rej);
+});
+
+// 4b. brotli：客户端声明 br 时优先 brotli（体积应小于 gzip），内容可还原，并带 Vary
+await new Promise((res, rej) => {
+  http.get({ host: '127.0.0.1', port: HTTP_PORT, path: '/big', headers: { Cookie: cookie, 'Accept-Encoding': 'br, gzip' } }, r => {
+    const chunks = [];
+    r.on('data', c => chunks.push(c));
+    r.on('end', () => {
+      const d = Buffer.concat(chunks);
+      const text = brotliDecompressSync(d).toString('utf8');
+      console.log('4b. brotli encoding:', r.headers['content-encoding'], '传输', d.length, 'B < gzip', gzipSize, 'B，解压后', text.length, 'B');
+      assert.strictEqual(r.headers['content-encoding'], 'br', '4b: 声明 br 应返回 brotli');
+      assert.ok(String(r.headers.vary || '').toLowerCase().includes('accept-encoding'), '4b: 压缩响应必须带 Vary');
+      assert.strictEqual(text.length, 100000, '4b: 解压后应完整还原');
+      assert.strictEqual(text, 'x'.repeat(100000), '4b: 内容必须逐字节一致');
+      assert.ok(d.length < gzipSize, '4b: brotli 应小于 gzip(' + gzipSize + ')，实际 ' + d.length);
+      console.log('4b. brotli 内容逐字节一致 OK');
+      res();
+    });
+  }).on('error', rej);
+});
+
+// 4c. 不支持 br 也不支持 gzip → 明文原样返回
+await new Promise((res, rej) => {
+  http.get({ host: '127.0.0.1', port: HTTP_PORT, path: '/big', headers: { Cookie: cookie, 'Accept-Encoding': 'identity' } }, r => {
+    let n = 0;
+    r.on('data', c => n += c.length);
+    r.on('end', () => {
+      assert.strictEqual(r.headers['content-encoding'], undefined, '4c: identity 时不得压缩');
+      assert.strictEqual(n, 100000, '4c: 应为未压缩的完整响应');
+      console.log('4c. identity 不压缩（', n, 'B）OK');
       res();
     });
   }).on('error', rej);
@@ -303,6 +350,414 @@ const qq = createQQServer({ infoUrls: ['http://127.0.0.1:' + TARGET + '/frpremot
 await qq.start(QQ_PORT);
 console.log('7. QQ bridge listening on', QQ_PORT);
 qq.close();
+
+// ─────────── DSH 浏览器会话 cookie 注入（新版 Host 通道要求会话）───────────
+// 假 DSH：没有有效会话 cookie 就一律 401（等价于 dsh web authentication required）
+const SESSION_TARGET = 18084;
+const SESSION_HTTP_PORT = 18085;
+const SESSION_HTTPS_PORT = 18086;
+const SESSION_COOKIE = 'dsh-auth-test=session-ok';
+const sessionSeen = [];
+const sessionTarget = http.createServer((req, res) => {
+  const ck = String(req.headers.cookie || '');
+  sessionSeen.push(ck);
+  if (!ck.includes(SESSION_COOKIE)) {
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  res.end('<html>dsh app</html>');
+});
+sessionTarget.on('upgrade', (req, socket) => {
+  sessionSeen.push('WS:' + String(req.headers.cookie || ''));
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n');
+});
+await new Promise(r => sessionTarget.listen(SESSION_TARGET, '127.0.0.1', r));
+
+let mintCalls = 0;
+let sessionCookie = null;
+const sessionProxy = createProxyServer({
+  targetPort: SESSION_TARGET, pfxPath: '', pfxPass: '',
+  getSessionCookie: () => sessionCookie,
+  refreshSessionCookie: async () => { mintCalls++; sessionCookie = SESSION_COOKIE; return sessionCookie; },
+});
+await sessionProxy.start(SESSION_HTTP_PORT, SESSION_HTTPS_PORT);
+const STOKEN = sessionProxy.token;
+
+// 8. 没有会话 cookie → 上游 401 → 自动铸签重放 → 200（手机端不该看到 401）
+await new Promise((res, rej) => {
+  http.get({ host: '127.0.0.1', port: SESSION_HTTP_PORT, path: '/', headers: { Cookie: 'dshr_token=' + STOKEN } }, r => {
+    let d = '';
+    r.on('data', c => d += c);
+    r.on('end', () => {
+      console.log('8. session 401->retry status:', r.statusCode, 'mintCalls:', mintCalls, '(expect 200, 1)');
+      assert.strictEqual(r.statusCode, 200);
+      assert.strictEqual(mintCalls, 1);
+      assert.ok(d.includes('dsh app'));
+      assert.ok(!sessionSeen[0].includes(SESSION_COOKIE), 'first upstream attempt carried no session cookie');
+      assert.ok(sessionSeen.some(c => c.includes(SESSION_COOKIE)), 'upstream saw injected session cookie');
+      res();
+    });
+  }).on('error', rej);
+});
+
+// 9. 会话 cookie 已在内存：直接注入，不再重复铸签
+await new Promise((res, rej) => {
+  const before = mintCalls;
+  http.get({ host: '127.0.0.1', port: SESSION_HTTP_PORT, path: '/api/x', headers: { Cookie: 'dshr_token=' + STOKEN } }, r => {
+    r.resume();
+    r.on('end', () => {
+      console.log('9. session cached status:', r.statusCode, 'extra mints:', mintCalls - before, '(expect 200, 0)');
+      assert.strictEqual(r.statusCode, 200);
+      assert.strictEqual(mintCalls, before);
+      res();
+    });
+  }).on('error', rej);
+});
+
+// 10. WebSocket 升级同样带上会话 cookie（/api 流走 WS）
+await new Promise((res, rej) => {
+  const timer = setTimeout(() => { rej(new Error('session ws timeout')); }, 5000);
+  const ws = http.request({
+    host: '127.0.0.1', port: SESSION_HTTP_PORT, path: '/ws', method: 'GET',
+    headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': 13, 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==', Cookie: 'dshr_token=' + STOKEN },
+  });
+  ws.on('upgrade', (r, socket) => {
+    clearTimeout(timer);
+    const last = sessionSeen[sessionSeen.length - 1];
+    console.log('10. ws carries session cookie:', last.startsWith('WS:') && last.includes(SESSION_COOKIE), '(expect true)');
+    assert.ok(last.startsWith('WS:') && last.includes(SESSION_COOKIE));
+    socket.destroy();
+    res();
+  });
+  ws.on('error', e => { clearTimeout(timer); rej(e); });
+  ws.end();
+});
+
+// 11. 未启用适配（旧版 DSH / dshSessionAuth: false）：401 原样透传，不做重放
+const plainProxy = createProxyServer({ targetPort: SESSION_TARGET, pfxPath: '', pfxPass: '' });
+await plainProxy.start(SESSION_HTTP_PORT + 10, SESSION_HTTPS_PORT + 10);
+await new Promise((res, rej) => {
+  http.get({ host: '127.0.0.1', port: SESSION_HTTP_PORT + 10, path: '/', headers: { Cookie: 'dshr_token=' + plainProxy.token } }, r => {
+    console.log('11. no session adapter status:', r.statusCode, '(expect 401)');
+    assert.strictEqual(r.statusCode, 401);
+    r.resume();
+    r.on('end', res);
+  }).on('error', rej);
+});
+// 12. 首个请求就是带 body 的 POST（/api RPC）：无法重放 → 该次 401，但会先补铸会话，
+//     随后请求即恢复正常（浏览器实际总是先 GET / 拿到 index，所以这条只是兜底语义）
+let postMints = 0;
+let postCookie = null;
+const postProxy = createProxyServer({
+  targetPort: SESSION_TARGET, pfxPath: '', pfxPass: '',
+  getSessionCookie: () => postCookie,
+  // 模拟真实实现的异步铸签时机（微任务之后才可用），确保断言反映真实行为
+  refreshSessionCookie: async () => { await new Promise(r => setTimeout(r, 0)); postMints++; postCookie = SESSION_COOKIE; return postCookie; },
+});
+await postProxy.start(SESSION_HTTP_PORT + 20, SESSION_HTTPS_PORT + 20);
+await new Promise((res, rej) => {
+  const body = '{"x":1}';
+  const r = http.request({
+    host: '127.0.0.1', port: SESSION_HTTP_PORT + 20, path: '/api/rpc', method: 'POST',
+    headers: { Cookie: 'dshr_token=' + postProxy.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+  }, (pres) => {
+    console.log('12a. first request POST status:', pres.statusCode, '(expect 401)');
+    assert.strictEqual(pres.statusCode, 401);
+    pres.resume();
+    pres.on('end', res);
+  });
+  r.on('error', rej);
+  r.end(body);
+});
+await new Promise(r => setTimeout(r, 50)); // 补铸是异步的：等它落地再断言
+assert.ok(postMints >= 1, 'body request without session still triggers a mint');
+assert.ok(postCookie, 'session cookie minted after the body request');
+console.log('12a2. mint triggered asynchronously, mints:', postMints, '(expect >=1)');
+await new Promise((res, rej) => {
+  http.get({ host: '127.0.0.1', port: SESSION_HTTP_PORT + 20, path: '/', headers: { Cookie: 'dshr_token=' + postProxy.token } }, r => {
+    console.log('12b. after mint status:', r.statusCode, '(expect 200)');
+    assert.strictEqual(r.statusCode, 200);
+    r.resume();
+    r.on('end', res);
+  }).on('error', rej);
+});
+postProxy.close();
+plainProxy.close();
+sessionProxy.close();
+sessionTarget.close();
+
+// 14. 注入脚本：语法正确；入口注入 DSH「设置」弹窗的导航列表，且只插入自己的节点
+//     真实故障①：脚本压根没执行（桌面端 tapIndex 不生效）→ 见第 15 项
+//     真实故障②：为了"挤进"侧栏改写容器与兄弟按钮行内样式 → 把用户侧栏底部原有内容挤没
+//     真实故障③：挂到侧栏某个"设置"按钮旁边，React 局部重渲染后节点被移除 → 图标时有时无
+//     现在的做法：往设置弹窗左侧导航列表里 append 自己的条目（点击打开面板），
+//     入口只此一个（右下角悬浮按钮已按要求移除）；全程不改动宿主样式，被 React 移除时由 MutationObserver 补回。
+{
+  const src = fs.readFileSync(new URL('../lib/index.mjs', import.meta.url), 'utf8');
+  const unescape = (s) => s.replace(/\\([\s\S])/g, '$1');
+  const qr = unescape(src.match(/const QR_RUNTIME = `([\s\S]*?)`;/)[1]);
+  const rawInject = unescape(src.match(/const INJECT_SCRIPT = `([\s\S]*?)`;/)[1]);
+  const code = rawInject.replace('${QR_RUNTIME}', qr);
+  assert.ok(code.length > 50000, 'inject script extracted, got ' + code.length);
+
+  const harness = (opts) => {
+    const navLabels = opts.nav === 'full' ? ['账号与余额', '通用设置', '模型', '内置插件']
+      : opts.nav === 'single' ? ['通用设置'] : [];
+    const byId = new Map();
+    const intervals = [];
+    const mkEl = (tag) => {
+      const el = {
+        tagName: String(tag).toUpperCase(), id: '', className: '', style: {}, children: [], parentNode: null,
+        textContent: '', innerHTML: '', title: '', type: '', _h: {},
+        appendChild(c) { c.parentNode = el; el.children.push(c); if (c.id) byId.set(c.id, c); return c; },
+        insertBefore(c, ref) {
+          c.parentNode = el;
+          const i = ref ? el.children.indexOf(ref) : -1;
+          if (i < 0) el.children.push(c); else el.children.splice(i, 0, c);
+          if (c.id) byId.set(c.id, c);
+          return c;
+        },
+        removeChild(c) { el.children = el.children.filter((x) => x !== c); c.parentNode = null; return c; },
+        setAttribute(k, v) { el[k] = v; if (k === 'id') { el.id = v; byId.set(v, el); } },
+        getAttribute(k) { return el[k] === undefined ? null : el[k]; },
+        addEventListener(t, fn) { (el._h[t] = el._h[t] || []).push(fn); },
+        removeEventListener() {},
+        contains(n) { return n === el || (n && n._inside === true) || el.children.indexOf(n) !== -1; },
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        getBoundingClientRect() { return { width: 120, height: 28, top: 200, left: 260, right: 380, bottom: 228 }; },
+        getContext() { return { fillRect() {}, fillStyle: '' }; },
+      };
+      return el;
+    };
+    const body = mkEl('body');
+    const head = mkEl('head');
+    // 模拟 DSH 设置弹窗左侧导航：一个容器 + 若干导航按钮（带既有行内样式）
+    const nav = mkEl('div');
+    nav.className = '_2H3hWW_settingsNav';
+    nav.style.width = '180px';
+    const navButtons = navLabels.map((t) => { const b = mkEl('button'); b.textContent = t; b.style.padding = '8px 10px'; nav.appendChild(b); return b; });
+    if (navLabels.length) body.appendChild(nav);
+    const before = { navStyle: JSON.stringify(nav.style), navChildren: nav.children.length };
+
+    const doc = {
+      readyState: 'complete', body, head, documentElement: mkEl('html'),
+      createElement: mkEl,
+      getElementById: (id) => byId.get(id) || null,
+      querySelector: () => null,
+      querySelectorAll: (sel) => (sel === 'button, [role="button"]' ? navButtons : []),
+      addEventListener() {},
+      elementFromPoint: () => ({ _inside: true }),
+    };
+    const win = {
+      innerWidth: 1920, innerHeight: 1080,
+      getComputedStyle: () => ({ getPropertyValue: () => '', display: 'block', visibility: 'visible', opacity: '1' }),
+      MutationObserver: function () { this.observe = () => {}; this.disconnect = () => {}; },
+    };
+    const posts = [];
+    const fetchStub = (url, o) => {
+      posts.push({ url, body: o && o.body });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true, config: {}, state: {} }) });
+    };
+    const mo = function () { this.observe = () => {}; this.disconnect = () => {}; };
+    const run = new Function('document', 'window', 'localStorage', 'fetch', 'setTimeout', 'setInterval', 'clearInterval', 'console', 'MutationObserver', code);
+    run(doc, win, { getItem: () => null, setItem() {} }, fetchStub,
+      (fn) => { try { fn(); } catch (e) { /* ignore */ } return 0; },
+      (fn) => { intervals.push(fn); return intervals.length; },
+      (id) => { if (id) intervals[id - 1] = null; },
+      console, mo);
+    return {
+      byId, body, nav, navButtons, before, posts,
+      fire: (el, t) => { for (const fn of (el && el._h && el._h[t]) || []) fn(); },
+      mounted: () => posts.filter((p) => p.url === '/frpremote/client-report').map((p) => JSON.parse(p.body)).filter((x) => x.stage === 'mounted').pop(),
+    };
+  };
+
+  // A. 设置弹窗打开（导航齐全）→ 条目注入导航列表，点击能打开面板，且没碰宿主样式
+  const a = harness({ nav: 'full' });
+  const aItem = a.byId.get('frprm-setitem');
+  assert.ok(aItem, 'A: 设置导航条目已创建');
+  assert.strictEqual(aItem.parentNode, a.nav, 'A: 注入到了设置导航容器里');
+  assert.strictEqual(a.nav.children.indexOf(aItem), a.before.navChildren, 'A: 追加在导航末尾');
+  assert.ok(String(aItem.innerHTML).indexOf('远程控制') !== -1, 'A: 条目带文字「远程控制」');
+  assert.strictEqual(JSON.stringify(a.nav.style), a.before.navStyle, 'A: 未改写导航容器行内样式');
+  assert.strictEqual(a.navButtons[0].style.padding, '8px 10px', 'A: 未改写原有导航项样式');
+  assert.strictEqual(a.nav.children.length, a.before.navChildren + 1, 'A: 只多了我们自己一个节点');
+  assert.strictEqual(a.mounted().settingsItem, true, 'A: 上报 settingsItem=true');
+  // 按用户要求：右下角悬浮按钮已移除，入口只有设置里这一个
+  assert.strictEqual(a.byId.get('frprm-fab'), undefined, 'A: 不再创建右下角悬浮按钮');
+  assert.strictEqual(a.body.children.length, 1, 'A: body 下只多了设置导航容器（没有悬浮按钮）');
+
+  // A2. 点击该条目 → 打开远程控制面板
+  a.fire(aItem, 'click');
+  assert.ok(a.byId.get('frprm-mask') && a.byId.get('frprm-panel'), 'A2: 点击设置里的条目会打开面板');
+
+  // B. 设置弹窗没开（页面里没有导航）→ 不插任何节点
+  const b = harness({ nav: 'none' });
+  assert.strictEqual(b.byId.get('frprm-setitem'), undefined, 'B: 没有导航容器时不注入');
+  assert.strictEqual(b.byId.get('frprm-fab'), undefined, 'B: 也没有悬浮按钮');
+  assert.strictEqual(b.nav.children.length, b.before.navChildren, 'B: 宿主节点数量不变');
+  assert.strictEqual(JSON.stringify(b.nav.style), b.before.navStyle, 'B: 宿主样式不变');
+  assert.strictEqual(b.mounted().settingsItem, false, 'B: 上报 settingsItem=false');
+
+  // C. 只有一个疑似导航项 → 不误判（要求同容器 >= 2 个），避免插到无关位置
+  const c = harness({ nav: 'single' });
+  assert.strictEqual(c.byId.get('frprm-setitem'), undefined, 'C: 单个候选不误判');
+  assert.strictEqual(c.nav.children.length, c.before.navChildren, 'C: 宿主节点数量不变');
+  console.log('14. 设置弹窗导航注入 + 点击打开面板 + 不误判/不碰宿主 OK');
+}
+
+// 13. findFreePort：Windows 下 SO_REUSEADDR 会让纯 bind 探测漏判（0.0.0.0 与 127.0.0.1 可同时绑上），
+//     于是同机第二个 DSH 实例会选中已占用端口、真正 listen 时才 EADDRINUSE。
+const OCCUPIED = 18120;
+const blocker = http.createServer((req, res) => res.end('x'));
+await new Promise(r => blocker.listen(OCCUPIED, '0.0.0.0', r));
+assert.strictEqual(await findFreePort(OCCUPIED, OCCUPIED + 1), OCCUPIED + 1, 'skips wildcard-occupied port');
+await new Promise(r => blocker.close(r));
+
+const loopBlocker = http.createServer((req, res) => res.end('y'));
+await new Promise(r => loopBlocker.listen(OCCUPIED + 2, '127.0.0.1', r));
+assert.strictEqual(await findFreePort(OCCUPIED + 2, OCCUPIED + 3), OCCUPIED + 3, 'skips loopback-occupied port');
+await new Promise(r => loopBlocker.close(r));
+
+assert.strictEqual(await findFreePort(OCCUPIED, OCCUPIED), OCCUPIED, 'picks a free port');
+
+// 13b. http/https 两个区间重叠：必须能用 exclude 选出互不相同的端口
+const p1 = await findFreePort(OCCUPIED, OCCUPIED + 3);
+const p2 = await findFreePort(OCCUPIED, OCCUPIED + 3, [p1]);
+assert.notStrictEqual(p1, p2, 'exclude keeps http/https ports distinct');
+assert.strictEqual(await findFreePort(OCCUPIED, OCCUPIED + 3, [p1, p2]), OCCUPIED + 2, 'exclude skips several ports');
+console.log('13. findFreePort skips occupied ports (wildcard + loopback), respects exclude OK');
+
+// 15. 桌面客户端唯一通道：apply() 必须**同步**注册 webserver/index-inject 结构化行
+//     （桌面壳 index.html 由静态 dist 直出 → tapIndex 永远不生效；注入表宿主启动时只收集一次）
+{
+  const prevHome = process.env.DSH_HOME;
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-frp-apply-'));
+  process.env.DSH_HOME = tmpHome;
+  try {
+    const listeners = new Map();
+    const stubWebServer = { port: 19080, host: '127.0.0.1', register: () => ({ dispose() {} }), tapIndex: () => ({ dispose() {} }), on() {}, off() {} };
+    const services = {
+      subprocess: { spawn: async () => { throw new Error('stub'); } },
+      webServer: stubWebServer,
+      connection: { authenticatedUrl: (u) => u, authorizeIndex: () => false },
+    };
+    const ctx = {
+      logger: { info() {}, warn() {}, error() {} },
+      get: (k) => services[k],
+      on(evt, cb) { if (!listeners.has(evt)) listeners.set(evt, []); listeners.get(evt).push(cb); },
+      off() {},
+      effect(fn) { try { const d = fn(); if (typeof d === 'function') d(); } catch (e) { /* ignore */ } return () => {}; },
+      timeout(fn) { return setTimeout(fn, 0); },
+      inject(deps, cb) { try { cb(ctx); } catch (e) { /* ignore */ } },
+    };
+    apply(ctx, { autoStart: false });
+    const cbs = listeners.get('webserver/index-inject') || [];
+    assert.strictEqual(cbs.length, 1, 'apply() 同步注册了 index-inject 行');
+    const table = [];
+    cbs[0](table);
+    const rows = table.filter((r) => r && r.kind === 'script' && typeof r.text === 'string' && r.text.indexOf('__frprmBooted') !== -1);
+    assert.strictEqual(rows.length, 1, '推送了一行内联 script');
+    assert.strictEqual(rows[0].placement, 'body', '行放在 body');
+    cbs[0](table); // 宿主可能重复收集
+    assert.strictEqual(table.filter((r) => r.kind === 'script').length, 1, '同一张表里不重复推');
+    console.log('15. apply() 同步注册桌面端注入行（kind=script, placement=body）OK');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+}
+
+// ─────────── 16. 下载路径绝不把宿主打死（EPERM / EBUSY 回归）───────────
+// 事故现场：压缩包被另一个进程持有时（另一个 DSH 实例正在下载 / 杀软扫描），
+// fs.createWriteStream 的异步 open 失败会 emit 'error' 事件；旧实现没挂监听器
+// → uncaughtException → DSH 宿主 fatal 退出（表现为"应用无法启动"）。
+// 旧实现的 http 'error' 回调里还有裸 fs.rmSync，EPERM 同样致命。
+{
+  const dir16 = fs.mkdtempSync(path.join(os.tmpdir(), 'frprm-dl-'));
+  const uncaught = [];
+  const onUncaught = (e) => uncaught.push(e);
+  process.on('uncaughtException', onUncaught);
+  // 假请求：req 是带 on/setTimeout/destroy 的桩；res 用 Readable 冒充 IncomingMessage
+  const fakeRequest = (script) => {
+    const fn = (url, opts, cb) => {
+      const req = {
+        on(ev, handler) { if (ev === 'error' && script.error) setTimeout(() => handler(script.error), 0); return req; },
+        setTimeout() { return req; },
+        destroy() { return req; },
+      };
+      if (script.status) {
+        const res = Readable.from(script.chunks || [Buffer.from('')]);
+        res.statusCode = script.status;
+        res.headers = script.headers || {};
+        setTimeout(() => cb(res), 0);
+      }
+      return req;
+    };
+    return fn;
+  };
+  const settle = (p) => Promise.race([
+    p.then(() => 'resolved', (e) => 'rejected:' + String((e && e.code) || (e && e.message) || e)),
+    new Promise((r) => setTimeout(() => r('TIMEOUT(永不 settle)'), 3000)),
+  ]);
+  try {
+    // 16a. 目标目录不存在（= open 失败）→ 必须干净 reject，不能是 uncaught + 永不 settle
+    const missing = path.join(dir16, 'no-such-dir', 'frp.zip');
+    const r16a = await settle(downloadFile('https://x/1', missing, 0, fakeRequest({ error: new Error('net down') })));
+    assert.ok(String(r16a).startsWith('rejected:'), '16a: open 失败应 reject，实际 ' + r16a);
+
+    // 16b. 正常下载 → 落到最终路径且内容正确，过程文件不残留
+    const ok = path.join(dir16, 'frp-ok.zip');
+    const r16b = await settle(downloadFile('https://x/2', ok, 2, fakeRequest({ status: 200, chunks: [Buffer.from('PK\u0003\u0004hello')] })));
+    assert.strictEqual(r16b, 'resolved', '16b: 正常下载应成功');
+    assert.strictEqual(fs.readFileSync(ok, 'utf8'), 'PK\u0003\u0004hello', '16b: 内容正确');
+    assert.deepStrictEqual(fs.readdirSync(dir16).filter((n) => n.includes('.part-')), [], '16b: 无 .part 残留');
+    console.log('16a/16b. open 失败只 reject 不炸宿主 + 正常下载落盘 OK');
+
+    // 16c. HTTP 非 200 → reject 且不产出文件
+    const bad = path.join(dir16, 'frp-500.zip');
+    const r16c = await settle(downloadFile('https://x/3', bad, 0, fakeRequest({ status: 500 })));
+    assert.strictEqual(r16c, 'rejected:download failed: HTTP 500', '16c: 应带 HTTP 状态 reject');
+    assert.strictEqual(fs.existsSync(bad), false, '16c: 不应产出文件');
+
+    // 16d. 落盘失败（最终路径是已存在目录）→ reject，不炸，不残留
+    const asDir = path.join(dir16, 'frp-is-dir.zip');
+    fs.mkdirSync(asDir);
+    const r16d = await settle(downloadFile('https://x/4', asDir, 0, fakeRequest({ status: 200, chunks: [Buffer.from('x')] })));
+    assert.ok(String(r16d).startsWith('rejected:'), '16d: rename 失败应 reject，实际 ' + r16d);
+    assert.deepStrictEqual(fs.readdirSync(dir16).filter((n) => n.includes('.part-')), [], '16d: 无 .part 残留');
+
+    // 16e. 302 跟随
+    const redir = path.join(dir16, 'frp-redirect.zip');
+    let calls = 0;
+    const reqFn = fakeRequest({ status: 200, chunks: [Buffer.from('final')] });
+    const firstFn = (url, opts, cb) => {
+      calls += 1;
+      if (calls === 1) return fakeRequest({ status: 302, headers: { location: 'https://x/final' } })(url, opts, cb);
+      return reqFn(url, opts, cb);
+    };
+    const r16e = await settle(downloadFile('https://x/5', redir, 0, firstFn));
+    assert.strictEqual(r16e, 'resolved', '16e: 302 应跟随');
+    assert.strictEqual(fs.readFileSync(redir, 'utf8'), 'final', '16e: 重定向后内容正确');
+    console.log('16c/16d/16e. HTTP 错误 / 落盘失败 / 302 跟随 OK');
+
+    // 16f. 过程文件名唯一且 ≠ 最终路径（多实例不再抢同一个文件）
+    const t1 = tmpDownloadPath(ok);
+    const t2 = tmpDownloadPath(ok);
+    assert.notStrictEqual(t1, t2, '16f: 临时名必须唯一');
+    assert.notStrictEqual(t1, ok, '16f: 临时名不得等于最终路径');
+    assert.strictEqual(path.dirname(t1), path.dirname(ok), '16f: 同目录（rename 才是同卷原子操作）');
+
+    assert.deepStrictEqual(uncaught.map((e) => (e && e.code) + ' ' + (e && e.syscall)), [], '16: 全程不得有 uncaughtException');
+    console.log('16. 下载路径不再打死宿主（EPERM/EBUSY 回归）OK');
+  } finally {
+    process.removeListener('uncaughtException', onUncaught);
+    fs.rmSync(dir16, { recursive: true, force: true });
+  }
+}
 
 // 0k. 纯 JS 二维码生成器（结构 + 确定性；可解码性由开发期 jsQR 回环验证）
 {

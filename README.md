@@ -32,7 +32,7 @@
 | 🧩 **局域网 / 公网独立开关** | 两者可单独开/关、互不影响；只开公网时代理切「纯转发」模式自动拦截局域网设备；二维码面板内本地 JS 生成（canvas），不依赖任何外部服务 |
 | 🔒 **安全认证** | 每次启动生成随机令牌；HttpOnly Cookie；局域网可免 token |
 | ⚡ **性能加速** | 反向代理自动 gzip 压缩，大历史会话加载更快 |
-| 📱 **侧边栏图标** | 手机快捷按钮常驻侧栏，刷新不消失 |
+| 📱 **设置里的入口** | 在 DSH「设置」弹窗左侧导航列表注入「远程控制」条目（只插入自己的节点），点击打开面板 |
 | 🤖 **六大机器人通道** | 微信 / QQ（NapCat）/ 纸飞机 Telegram / 钉钉 / 飞书 / 企业微信，统一命令路由，面板内一键复制回调地址 |
 
 ## 🚀 快速开始
@@ -146,7 +146,7 @@ curl -s http://127.0.0.1:3080/frpremote/info | head -c 300
         frpRemotePort: 13080     # 公网访问端口
 ```
 
-重启 DSH 后，侧栏出现「📱 远程frp」按钮 → 打开面板即可看到
+重启 DSH 后，打开「设置」弹窗 → 左侧列表底部的「远程控制」→ 打开面板即可看到
 `http://your.vps.example.com:13080/?token=...` 公网链接。
 
 ## ⚙️ 配置项
@@ -175,7 +175,7 @@ curl -s http://127.0.0.1:3080/frpremote/info | head -c 300
 | `frpVhostHTTPSPort` | `443` | https 模式：frps 侧 `vhostHTTPSPort` |
 | `frpHttpsCertFile` | `''` | https 模式访客侧域名证书：文件路径或粘贴 PEM（自动落盘；需匹配域名） |
 | `frpHttpsKeyFile` | `''` | https 模式访客侧域名私钥：文件路径或粘贴 PEM（自动落盘，0600） |
-| `targetPort` | `3080` | DSH 自身端口 |
+| `targetPort` | 自动探测 | DSH 自身端口。留空时取 DSH 实际监听端口（`webServer.port`）；取不到才回退 `3080` |
 | `httpPortStart` | `3081` | 局域网 HTTP 起始端口（自动跳过占用） |
 | `httpsPortStart` | `3082` | 局域网 HTTPS 起始端口 |
 | `qqPortStart` | `3001` | QQ OneBot 桥起始端口 |
@@ -184,6 +184,7 @@ curl -s http://127.0.0.1:3080/frpremote/info | head -c 300
 | `toolsDir` | `''` | 工具与证书缓存目录；留空使用 `$DSH_HOME/tools` |
 | `autoStart` | `true` | 插件加载即自动启动 |
 | `lanOpen` | `true` | 局域网免 token（私网来源放行；公网隧道仍要 token） |
+| `dshSessionAuth` | `''`（自动开启） | 自动适配 DSH 浏览器会话鉴权（见「桌面客户端」章节）；可设 `'true'`/`'false'`，面板「设置」页也可改 |
 
 ### http（域名）模式示例
 
@@ -197,9 +198,142 @@ config:
   frpVhostHTTPPort: 80
 ```
 
+## 🖥 桌面客户端（DeepSeek Harness 桌面版）
+
+桌面客户端（`DeepSeek Harness.exe`）跑的是 `desktop` profile，和命令行 `dsh web` 有两处关键差异，插件已自动适配，**无需改配置**：
+
+**1. DSH 端口不是 3080。** 桌面客户端由 `dsh-desktop-host` 固定传入 `--port 19387`（写死在客户端内），而插件默认的 `targetPort` 曾是 `3080`，代理会把请求转发到没人监听的端口 → 手机端只能看到 `502 bad gateway`。
+现在留空 `targetPort` 时插件直接取 DSH 实际监听端口（`webServer.port`），`dsh web` 用户行为不变；要覆盖仍可显式配置。
+
+**2. 新版 DSH 的 Host 通道要求「浏览器会话」。** 只有 `GET /?token=<launchToken>` 能换取一枚绑定 authority 的签名 cookie，否则 `/`、`/api`、WebSocket 全部返回：
+
+```
+HTTP/1.1 401 Unauthorized
+dsh web authentication required; reopen the URL printed by dsh web.
+```
+
+而 `launchToken` 是每个进程随机生成、只存在内存里的（桌面客户端既不打印也不落盘），手机上拿不到，所以插件给的链接永远停在 401。
+插件现在的做法是**复用 DSH 官方接口**：通过 `connection` 服务的 `authenticatedUrl()` 拿到带 token 的 URL、再用 `authorizeIndex()` 让 **DSH 自己铸 cookie**，然后给所有转发请求（含 WebSocket 升级）带上；上游返回 401 时自动重铸并原样重放一次（仅 GET/HEAD）。
+好处是不硬编码 cookie 格式——DSH 以后换算法/换 cookie 名也不会失效；旧版 DSH 没有 `connection` 服务时静默跳过，行为和以前一致。
+
+**验证方式**：`http://127.0.0.1:<DSH端口>/frpremote/info` 现在会多两个字段：
+
+```bash
+curl -s http://127.0.0.1:19387/frpremote/info
+# "targetPort":19387,"dshSession":"ok"     ← 端口解析正确 + 会话 cookie 已铸签
+# dshSession 取值：ok 已就绪 | none 尚未铸签（首次请求会自动补） | off 已手动关闭
+# "panel":{"stage":"mounted","where":"settings"}   ← 面板入口状态：
+#   settingsItem 设置弹窗导航里的「远程控制」条目是否注入成功
+#   attachTo 注入到哪个容器 | error 挂载异常（带 message）
+```
+
+**入口在哪**：**DSH「设置」弹窗左侧导航列表里的「远程控制」条目**（与「账号与余额 / 通用设置 / 模型 / 内置插件」并列，点击打开面板）。
+设置弹窗是懒渲染的，条目由 MutationObserver 在弹窗打开时注入、React 重渲染把它移除时补回；只往宿主里 append 自己那一个节点，其余一律不动。
+（右下角的悬浮按钮已按用户要求移除，入口只此一个。）点开面板后，顶部第 4 个标签「设置」才是插件自身的配置入口。
+
+> **重要约束：只插入自己的节点，绝不改写宿主的任何东西。** 早期版本为了把按钮"挤进"侧栏，
+> 改写了容器与兄弟按钮的行内样式，踩了两个真实的坑：① 被改写的侧栏底部（账号/设置区）原有内容被挤没；
+> ② 插入点整块区域被祖先裁掉 → 上报"已插入"但界面上什么都没有。
+> 现在的规则是：`insertBefore` 自己的按钮 → 命中测试（`document.elementFromPoint`）确认真的可见 →
+> 不可见就撤销自己的节点。测试第 14 项会断言导航容器/原有导航项的行内样式与子节点数量都没被动过。
+
+**为什么桌面端的面板能出来（实现要点，改代码前务必读）**：桌面客户端主窗口加载的是 `dsh-app://app/`，
+index.html 由安装包静态 dist 直出，`webServer.tapIndex` 的函数变换**永远过不去**（同机 `dsh-whale-widget`
+的实测结论）。所以插件用两条官方通道并存：
+
+| 通道 | 覆盖 | 说明 |
+|---|---|---|
+| `webserver/index-inject` 结构化行 | 桌面 + web | `{kind:'script', placement:'body', text: INJECT_SCRIPT}`，**桌面端唯一生效的通道**；注入表在宿主 ready 时只收集一次，因此必须在 `apply()` 里**同步**注册（放进 `ctx.inject` 回调会错过） |
+| `webServer.tapIndex` | 仅 web | 先检查 HTML 里有没有 `__frprmBooted`，有就跳过 → 与结构化行天然去重 |
+
+两条通道都到位时，由页内 `window.__frprmBooted` 守卫保证脚本只执行一次。
+
+**面板里也能看、也能改**：点开面板，状态行下方常驻一行生效诊断：
+
+```
+上游 127.0.0.1:19387 · DSH 会话 已就绪
+```
+
+「设置」页新增分组 **远程适配（高级，一般不用改）**：
+
+| 字段 | 说明 |
+|---|---|
+| DSH 上游端口 | 留空 = 自动探测（输入框占位符会显示当前解析到的端口）；填了就固定用它 |
+| DSH 会话适配 | `自动`（推荐，默认开启）/ `强制开启` / `关闭（旧版行为）` |
+
+改完点「保存并重启」即可，写入 `toolsDir/frp-config.json`，无需碰 YAML。
+
+> 桌面客户端安装/更新插件后**需要重启客户端**：bundle 注册表变更不走热加载。重启会换发新的 `launchToken`，但会话 cookie 由持久化密钥签发，无需重新扫码。
+
+### ⚠️ frpc 自动下载：曾把客户端直接搞崩（v1.10.4 修复）
+
+**现象**：桌面客户端启动即弹「应用无法启动或已意外停止」，crash 日志里是：
+
+```
+dsh: fatal uncaught exception: [Error: EPERM: operation not permitted,
+  open 'C:\Users\Cotx\.dsh\tools\frp_0.71.0_windows_amd64.zip']
+```
+
+**根因**：`frpcPath` 留空且 `toolsDir` 里没有 `frpc.exe` 时，插件会在启动时自动下载压缩包。
+旧实现把压缩包**直接写到最终路径**，而这里有两个没有接住的抛出点：
+
+1. `fs.createWriteStream(dest)` 的 open 是**异步**的，失败时以 `'error'` 事件抛出；
+   旧实现没挂 `error` 监听器 → 变成 `uncaughtException` → DSH 宿主 fatal 退出。
+2. 网络 `error` 回调里的 `fs.rmSync(dest, { force: true })` 没有保护，文件被占用时抛 `EPERM`，同样致命。
+
+**触发条件**：同一个压缩包路径被第二个进程持有——两个 DSH 实例同时启动/重启，
+或者杀软正在扫描刚下完的文件。此时后启动的那个实例不是"报错"，而是**整个宿主进程死掉**。
+
+**修复方式**（改这块代码时请保留这些不变量）：
+
+- 下载一律先写「同目录 + pid + 随机后缀」的临时文件，成功后再 `renameSync` 原子改名；
+  任何失败只 `reject` 并删掉临时文件，**绝不 emit 未处理的 error**。
+- 所有 `rmSync` 走 `safeRm()`（吞掉 EPERM/EBUSY）。
+- 归档名与解压目录也带随机后缀，多实例不再共用同一个路径；同进程内 `downloadFrpc` 单飞。
+- `cleanupStaleDownloads()` 会清掉 10 分钟前的 `frp-download-*` / `frp-extract-*` / `frp_x.y.z_*` 残留
+  （含旧版本直接落在 `toolsDir` 的压缩包），被占用就跳过。
+- 如果你想手动放一个 frpc：把 `frpc.exe` 丢进 `toolsDir`，或在设置页填 `frpc 可执行文件路径`，
+  就完全不会走下载逻辑。
+
+### 🐢 远程访问"慢 / 断断续续"的实测结论（v1.10.5）
+
+这不是插件的问题，而是**链路 + frp 默认配置**的问题。实测数据（某真实环境，手机经 frp 访问桌面端 DSH）：
+
+| 场景 | 吞吐 |
+|---|---|
+| 到国内 CDN，**单条 TCP 连接** | 2.6 Mbps |
+| 到国内 CDN，**4 条独立 TCP 连接** | **10.0 Mbps**（4 倍叠加） |
+| 经 frp 隧道（1 条复用 TCP），1 条或 4 条并发流 | 0.9 Mbps（**完全不叠加**） |
+| 局域网直连（对照） | 48 MB/s |
+
+三个关键推论：
+
+1. **瓶颈是"单条 TCP 连接的吞吐"，不是带宽上限**。很多线路（尤其家宽/CPE/跨境）单连接只能跑 2~3 Mbps，但多连接能叠加到 10 Mbps 以上——这也解释了为什么"测速软件显示 1MB/s"却还是慢：测速用的是多连接。
+2. **frp 默认 `transport.tcpMux = true`**，把客户端所有连接复用进**同一条 TCP**，于是浏览器开再多并发也只能分到那 2~3 Mbps。
+3. **DSH 的 WebSocket 每 2 秒发一次 ping，约 5 秒收不到 pong 就断开连接**（客户端全部交互都走 `/api/remote.mux` 这一条 WS）。首屏要搬 ~10MB bundle，把那条复用 TCP 占满时，ping/pong 被排队到数百 ms~1s 以上，偶发超过 5 秒 → 服务端掐连接 → 客户端自动重连 → 界面上就是"模型选择/会话列表加载成功一下又开始加载"。
+
+**解决办法（需要你在 frps 服务器上一起改）**：
+
+```toml
+# frps.toml 和 frpc.toml 里都要有，且必须一致！只改一边会直接连不上
+transport.tcpMux = false
+```
+
+- 服务端：改 `frps.toml` → 重启 frps。
+- 客户端：面板「设置」→ **远程适配（高级）** → `TCP 多路复用` 选「关闭（并发带宽更高，需 frps 同步配置）」→ 保存并重启。
+- 官方文档：[通信安全及优化 · TCP 多路复用](https://gofrp.org/zh-cn/docs/features/common/network/network/)（原文："该配置项在服务端和客户端必须一致"）。
+
+关掉多路复用后：每个浏览器连接各自走一条 TCP，能吃上并发叠加（首屏快数倍），而且 **WS 有自己的 TCP 连接**，不再被大文件下载顶死，ping/pong 恢复到 RTT 级别（实测 15ms），"断断续续"消失。
+
+顺带的两项优化（v1.10.5 内置，无需配置）：
+
+- WS 升级桥两侧启用 `setNoDelay`，避免小帧被 Nagle 攒着（对 ping/pong 敏感）。
+- 压缩从 gzip 升级为 **br（brotli）优先**：文本体积再小 ~25%，并补上 `Vary: accept-encoding`。
+  注意：**主流浏览器（Chrome 等）只在 HTTPS 下才声明 `br`**，所以纯 HTTP 的隧道访问实际仍是 gzip；要用上 brotli 得走 https 模式或局域网 HTTPS（3082）。
+
 ## 📱 使用方法
 
-1. 启动后侧栏出现「📱 远程frp」按钮
+1. 打开「设置」弹窗 → 左侧导航列表底部的「远程控制」条目
 2. 点击 → 面板显示运行状态（局域网 / 公网 双指示灯）
 3. 「公网」标签：**连接公网 / 断开**（控制 frp 隧道）
    「局域网」标签：**开启局域网 / 关闭**（控制局域网直连）
